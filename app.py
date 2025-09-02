@@ -4,7 +4,10 @@ import aiofiles, httpx
 
 APP_SECRET = os.getenv("ALPHAOPS_SECRET", "")
 DISCORD    = os.getenv("DISCORD_WEBHOOK_STATUS", "")
-LOG_PATH   = os.getenv("LOG_PATH", "./cme_sandbox.jsonl")
+LOG_PATH   = os.getenv("LOG_PATH", "/mnt/data/cme_sandbox.jsonl")
+
+# Ensure the directory exists at startup
+os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 
 app = FastAPI(title="AlphaOps CME Sandbox")
 
@@ -16,15 +19,13 @@ async def ingest_tv(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="invalid JSON")
 
-    # verify secret
     if payload.get("auth") != APP_SECRET:
         raise HTTPException(status_code=401, detail="bad secret")
 
-    # write to log file
+    # Append to log file safely
     async with aiofiles.open(LOG_PATH, "a") as f:
         await f.write(json.dumps(payload) + "\n")
 
-    # optional Discord echo
     if DISCORD:
         summary = f"✅ {payload.get('exchange')} {payload.get('symbol')} {payload.get('tf')} | split_abs={payload.get('rsi_split_abs')} | d_bps={payload.get('dist_d_bps')}"
         async with httpx.AsyncClient(timeout=5) as client:
