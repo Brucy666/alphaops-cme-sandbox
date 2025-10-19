@@ -1,71 +1,81 @@
-# app.py
-import os, json
+import os
+import json
+from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
-import aiofiles, httpx
+import aiofiles
+import httpx
+from supabase import create_client, Client
 
+# === ENVIRONMENT VARIABLES ===
 APP_SECRET = os.getenv("ALPHAOPS_SECRET", "")
-DISCORD    = os.getenv("DISCORD_WEBHOOK_STATUS", "")
-LOG_PATH   = os.getenv("LOG_PATH", "/mnt/data/cme_sandbox.jsonl")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_STATUS", "")
+LOG_PATH = os.getenv("LOG_PATH", "/mnt/data/cme_sandbox.json")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-CME_TABLE    = os.getenv("SUPABASE_CME_TABLE", "hp_cme_rsi")
+# === INITIALIZE ===
+app = FastAPI(title="AlphaOps CME RSI Bot")
+os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 
-app = FastAPI(title="AlphaOps CME Sandbox")
+# === SUPABASE CLIENT ===
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-async def upsert_cme_to_supabase(payload: dict):
-    """Upsert CME RSI event into Supabase."""
-    if not (SUPABASE_URL and SUPABASE_KEY):
-        return  # quietly skip if not configured
-
-    # Map/normalize incoming payload → table columns
-    # From your code: exchange, symbol, t, rsi_split_abs, dist_d_bps, plus tf maybe
-    ts_raw   = payload.get("t")                       # expect ISO string from TV
-    symbol   = payload.get("symbol") or "BTCUSD.P"
-    tf       = payload.get("tf") or payload.get("timeframe") or "1m"
-    rsi_val  = payload.get("rsi_split_abs") or payload.get("rsi")
-    dist_bps = payload.get("dist_d_bps") or payload.get("d_bps")
-
-    row = {
-        "ts":       ts_raw,
-        "symbol":   str(symbol),
-        "tf":       str(tf),
-        "exchange": payload.get("exchange") or "CME",
-        "rsi":      float(rsi_val) if rsi_val is not None else None,
-        "dist_bps": float(dist_bps) if dist_bps is not None else None,
-        "payload":  payload,
-    }
-
-    # Supabase PostgREST upsert (merge duplicates by unique index)
-    url = f"{SUPABASE_URL}/rest/v1/{CME_TABLE}"
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates,return=minimal",
-    }
-    async with httpx.AsyncClient(timeout=8.0) as client:
-        resp = await client.post(url, headers=headers, json=[row])
-        resp.raise_for_status()
 
 @app.post("/ingest/test")
-async def ingest_tv(request: Request):
-    body = await request.body()
+async def ingest(request: Request):
     try:
+        body = await request.body()
         payload = json.loads(body.decode("utf-8"))
     except Exception:
-        raise HTTPException(status_code=400, detail="invalid JSON")
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
+    # === SECURITY CHECK ===
     if payload.get("auth") != APP_SECRET:
-        raise HTTPException(status_code=401, detail="bad secret")
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Log to file (unchanged)
-    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    # === SAVE TO LOG ===
     async with aiofiles.open(LOG_PATH, "a") as f:
         await f.write(json.dumps(payload) + "\n")
 
-    # Upsert to Supabase (NEW)
+    # === UPSERT INTO SUPABASE ===
     try:
-        await upsert_cme_to_supabase(payload)
+        ts = payload.get("timestamp") or datetime.utcnow().isoformat()
+        symbol = payload.get("symbol", "BTCUSD.P")
+        rsi = float(payload.get("rsi", 0))
+        dist_bps = float(payload.get("dist_d_bps", 0))
+        tf = payload.get("tf", "1m")
+
+        data = {
+            "ts": ts,
+            "symbol": symbol,
+            "tf": tf,
+            "exchange": "CME",
+            "rsi": rsi,
+            "dist_bps": dist_bps,
+            "payload": payload,
+        }
+
+        result = supabase.table("hp_cme_rsi").upsert(data).execute()
+        print(f"Inserted CME RSI for {symbol} at {ts}")
+
     except Exception as e:
-       
+        print(f"Supabase insert error: {e}")
+
+    # === DISCORD POST (optional) ===
+    if DISCORD_WEBHOOK:
+        try:
+            summary = (
+                f"📊 **CME RSI Update** — {symbol}\n"
+                f"RSI: `{rsi}` | Δbps: `{dist_bps}` | TF: `{tf}`"
+            )
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(DISCORD_WEBHOOK, json={"content": summary})
+        except Exception as e:
+            print(f"Discord error: {e}")
+
+    return {"status": "ok"}
+
+
+@app.get("/")
+async def root():
+    return {"status": "CME RSI bot running", "time": datetime.utcnow().isoformat()}
