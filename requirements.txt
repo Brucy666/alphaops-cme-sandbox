@@ -1,6 +1,6 @@
-fastapi
-uvicorn[standard]
-httpx
-aiofiles
-python-dotenv
-supabase
+fastapi==0.110.*
+uvicorn[standard]==0.30.*
+aiofiles==24.*
+httpx==0.27.*
+supabase==2.*     
+python-dotenv==1.*
